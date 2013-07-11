@@ -3,8 +3,8 @@
  * File containing the eZDFSFileHandler class.
  *
  * @copyright Copyright (C) 1999-2013 eZ Systems AS. All rights reserved.
- * @license http://www.gnu.org/licenses/gpl-2.0.txt GNU General Public License v2
- * @version //autogentag//
+ * @license http://ez.no/eZPublish/Licenses/eZ-Trial-and-Test-License-Agreement-eZ-TTL-v2.0 eZ Trial and Test License Agreement Version 2.0
+ * @version 5.1.0
  * @package kernel
  */
 
@@ -406,6 +406,7 @@ class eZDFSFileHandler implements eZClusterFileHandlerInterface, ezpDatabaseBase
         $curtime   = time();
         $tries     = 0;
         $noCache   = false;
+        $localfileTS = 0;
 
         if ( $expiry < 0 )
             $expiry = null;
@@ -429,203 +430,194 @@ class eZDFSFileHandler implements eZClusterFileHandlerInterface, ezpDatabaseBase
                 }
                 else
                 {
-                    if ( $this->isLocalFileExpired( $expiry, $curtime, $ttl ) )
+                    // 1st check is for validity of local file
+                    $localfileTS = @filemtime( $this->filePath );
+                    if ( ( $stale = self::isFileExpired( $this->filePath, $localfileTS, $expiry, $curtime, $ttl ) ) )
                     {
-                        // if we are in stale cache mode, we only forceDB if the
-                        // file does not exist at all
-                        if ( $this->useStaleCache )
+                        // if we are in stale cache mode, and local file does not exist at all, we wait for it to appear
+                        if ( $this->useStaleCache && $localfileTS == 0 )
                         {
-                            if ( !file_exists( $this->filePath ) )
+                            // no DB or FS file available
+                            /// @todo should we also take into account -1 ?
+                            if ( $this->metaData === false )
                             {
+                                /// @todo reviews following code block, it probably does not jump to where it should
+
+                                // configuration says we have to generate our own version
+                                if ( $this->nonExistantStaleCacheHandling[ $this->cacheType ] == 'generate' )
+                                {
+                                    // no cache available, but a generate callback exists, skip to generation
+                                    if ( $generateCallback !== false )
+                                    {
+                                        eZDebugSetting::writeDebug( 'kernel-clustering', "Database file is deleted, need to regenerate data" );
+                                        break;
+                                    }
+                                    // if no generate callback exists, we can directly skip the main loop
+                                    else
+                                    {
+                                        eZDebugSetting::writeDebug( 'kernel-clustering', "Database file is deleted, cannot get data" );
+                                        break 2;
+                                    }
+                                }
+                                // wait for the generating process to be finished (or timedout)
+                                else
+                                {
+                                    while ( $this->remainingCacheGenerationTime-- >= 0 )
+                                    {
+                                        // we don't know if the file gets generated on the current
+                                        // frontend or not. However, we can still try the FS cache
+                                        // first, then the DB cache if FS is not found, since this
+                                        // will be much more efficient
+                                        if ( !file_exists( $this->filePath ) )
+                                        {
+                                            $this->loadMetaData( true );
+                                            if ( $this->metaData === false )
+                                            {
+                                                // nothing yet in db
+                                                sleep( 1 );
+                                            }
+                                            else
+                                            {
+                                                // file appeared in db
+                                                break;
+                                            }
+                                        }
+                                        else
+                                        {
+                                            // hey, local file popped up! whee
+                                            break;
+                                        }
+                                    }
+
+                                    // if we reached this point, it means that we are over the estimated timeout value
+                                    // we try to take the generation over by starting the cache generation. IF this
+                                    // fails again, it is probably because another waiting process has taken the generation
+                                    // over. Maybe add a counter here to prevent some kind of death loop ?
+                                    eZDebugSetting::writeDebug( 'kernel-clustering', "Checking if {$this->filePath} was generating during the wait loop", __METHOD__ );
+                                    $this->loadMetaData( true );
+                                    $this->useStaleCache = false;
+                                    $this->remainingCacheGenerationTime = false;
+                                    $forceDB = false;
+
+                                    // this continues to the main loop 'while (true)'
+                                    continue 2;
+                                }
+                            }
+                            else
+                            {
+                                // Local file does not exist, db file does, try to get data from db
                                 eZDebugSetting::writeDebug( 'kernel-clustering', "Local file '{$this->filePath}' does not exist and can not be used for stale cache. Checking with DB", __METHOD__ );
                                 $forceDB = true;
-
-                                // forceDB + useStaleCache means that we should check for the DB file.
                             }
                         }
                         else
                         {
-                            // Local file is older than global timestamp, check with DB
-                            eZDebugSetting::writeDebug( 'kernel-clustering', "Local file (mtime=" . @filemtime( $this->filePath ) . ") is older than timestamp ($expiry) and ttl($ttl), check with DB", __METHOD__ );
+                            // Local file is expired, try to get data from DB
+                            eZDebugSetting::writeDebug( 'kernel-clustering', "Local file (mtime=" . @filemtime( $this->filePath ) . ") is older than timestamp ($expiry) or ttl($ttl). Checking with DB", __METHOD__ );
                             $forceDB = true;
                         }
                     }
                 }
 
-                if ( !$forceDB )
+                // even if local file is not expired
+                // we still always check if file in DB is valid: not deleted or expired
+                if ( ( $missing = ( $this->metaData === false || $this->metaData['mtime'] < 0 ) ) || $this->isDBFileExpired( $this->metaData['mtime'], $curtime, $ttl ) )
                 {
-                    // check if DB file is deleted
-                    if ( !$this->useStaleCache && ( $this->metaData === false || $this->metaData['mtime'] < 0 ) )
+                    if ( $generateCallback !== false )
                     {
-                        if ( $generateCallback !== false )
-                            eZDebugSetting::writeDebug( 'kernel-clustering', "Database file is deleted, need to regenerate data", __METHOD__ );
-                        else
-                            eZDebugSetting::writeDebug( 'kernel-clustering', "Database file is deleted, cannot get data", __METHOD__ );
+                        eZDebugSetting::writeDebug( 'kernel-clustering', "Database file is " . (  $missing ? 'deleted' : 'expired' ) . ", need to regenerate data", __METHOD__ );
                         break;
                     }
-
-                    // check if FS file is older than DB file
-                    if ( !$this->useStaleCache && $this->isLocalFileExpired( $this->metaData['mtime'], $curtime, $ttl ) )
-                    {
-                        eZDebugSetting::writeDebug( 'kernel-clustering', "Local file (mtime=" . @filemtime( $this->filePath ) . ") is older than DB, checking with DB", __METHOD__ );
-                        $forceDB = true;
-                    }
                     else
                     {
-                        if ( $this->useStaleCache )
-                        {
-                            // to get the retrieve callback to accept the cache file,
-                            // we force its mtime to the current time
-                            $mtime = $curtime;
-                            eZDebugSetting::writeDebug( 'kernel-clustering', "Processing local stale cache file {$this->filePath}", __METHOD__ );
-                        }
-                        else
-                        {
-                            $mtime = filemtime( $this->filePath );
-                            eZDebugSetting::writeDebug( 'kernel-clustering', "Processing local cache file {$this->filePath}", __METHOD__ );
-                        }
-
-                        $args = array( $this->filePath, $mtime );
-                        if ( $extraData !== null )
-                            $args[] = $extraData;
-                        $retval = call_user_func_array( $retrieveCallback, $args );
-                        if ( $retval instanceof eZClusterFileFailure )
-                        {
-                            break;
-                        }
-                        return $retval;
+                        eZDebugSetting::writeDebug( 'kernel-clustering', "Database file is " . (  $missing ? 'deleted' : 'expired' ) . ", cannot get data", __METHOD__ );
+                        break 2;
                     }
                 }
 
-                if ( $forceDB )
+                // check if FS file is older than DB file
+                // NOTE: this might be sensible to clock skew between different frontends
+                if ( !$forceDB && $localfileTS < $this->metaData['mtime'] )
                 {
-                    // stale cache, and no DB or FS file available
-                    if ( $this->useStaleCache && $this->metaData === false )
+                    eZDebugSetting::writeDebug( 'kernel-clustering', "Local file (mtime=$localfileTS) is older than DB, checking with DB", __METHOD__ );
+                    $forceDB = true;
+                }
+
+                // we still consider local file good
+                if ( !$forceDB )
+                {
+                    if ( $stale )
                     {
-                        // configuration says we have to generate our own version
-                        if ( $this->nonExistantStaleCacheHandling[ $this->cacheType ] == 'generate' )
-                        {
-                            // no cache available, but a generate callback exists, skip to generation
-                            if ( $generateCallback !== false )
-                            {
-                                eZDebugSetting::writeDebug( 'kernel-clustering', "Database file is deleted, need to regenerate data" );
-                                break;
-                            }
-                            // if no generate callback exists, we can directly skip the main loop
-                            else
-                            {
-                                eZDebugSetting::writeDebug( 'kernel-clustering', "Database file is deleted, cannot get data" );
-                                break 2;
-                            }
-                        }
-                        // wait for the generating process to be finished (or timedout)
-                        else
-                        {
-                            while ( $this->remainingCacheGenerationTime-- >= 0 )
-                            {
-                                // we don't know if the file gets generated on the current
-                                // frontend or not. However, we can still try the FS cache
-                                // first, then the DB cache if FS is not found, since this
-                                // will be much more efficient
-                                if ( !file_exists( $this->filePath ) )
-                                {
-                                    $this->loadMetaData( true );
-                                    if ( $this->metaData === false )
-                                    {
-                                        sleep( 1 );
-                                        continue;
-                                    }
-                                    else
-                                    {
-                                        break;
-                                    }
-                                }
-                                else
-                                {
-                                    break;
-                                }
-                            }
-
-                            // if we reached this point, it means that we are over the estimated timeout value
-                            // we try to take the generation over by starting the cache generation. IF this
-                            // fails again, it is probably because another waiting process has taken the generation
-                            // over. Maybe add a counter here to prevent some kind of death loop ?
-                            eZDebugSetting::writeDebug( 'kernel-clustering', "Checking if {$this->filePath} was generating during the wait loop", __METHOD__ );
-                            $this->loadMetaData( true );
-                            $this->useStaleCache = false;
-                            $this->remainingCacheGenerationTime = false;
-                            $forceDB = false;
-
-                            // this continues to the main loop 'while (true)'
-                            continue 2;
-                        }
-                    }
-                    // no stale cache, and expired DB file
-                    elseif ( !$this->useStaleCache && ( $this->metaData === false || $this->isDBFileExpired( $expiry, $curtime, $ttl ) ) ) // no stalecache, and no DB file, generation is required
-                    {
-                        // no cache available, but a generate callback exists, skip to generation
-                        if ( $generateCallback !== false )
-                        {
-                            eZDebugSetting::writeDebug( 'kernel-clustering', "Database file is deleted, need to regenerate data", __METHOD__ );
-
-                            // we break out of one loop so that the generateCallback is called
-                            break;
-                        }
-                        // if no generate callback exists, we can directly skip the main loop
-                        else
-                        {
-                            eZDebugSetting::writeDebug( 'kernel-clustering', "Database file is deleted, cannot get data", __METHOD__ );
-
-                            // we break out of two loops so that we directly exit the method and have
-                            // the rest of execution generate the data
-                            break 2;
-                        }
+                        // to get the retrieve callback to accept the cache file,
+                        // we force its mtime to the current time
+                        $mtime = $curtime;
+                        eZDebugSetting::writeDebug( 'kernel-clustering', "Processing local stale cache file {$this->filePath}", __METHOD__ );
                     }
                     else
                     {
-                        eZDebugSetting::writeDebug( 'kernel-clustering', "Callback from DB file {$this->filePath}", __METHOD__ );
-                        if ( self::LOCAL_CACHE )
-                        {
-                            if ( $this->fetch() === false )
-                            {
-                                return new eZClusterFileFailure( eZClusterFileFailure::FILE_RETRIEVAL_FAILED, "Failed retrieving file $this->filePath from DFS." );
-                            }
-
-                            // Figure out which mtime to use for new file, must be larger than
-                            // mtime in DB at least.
-                            $mtime = $this->metaData['mtime'] + 1;
-                            $localmtime = @filemtime( $this->filePath );
-                            $mtime = max( $mtime, $localmtime );
-                            touch( $this->filePath, $mtime, $mtime );
-                            clearstatcache(); // Needed because of touch() call
-
-                            $args = array( $this->filePath, $mtime );
-                            if ( $extraData !== null )
-                                $args[] = $extraData;
-                            $retval = call_user_func_array( $retrieveCallback, $args );
-                            if ( $retval instanceof eZClusterFileFailure )
-                            {
-                                break;
-                            }
-                            return $retval;
-                        }
-                        else
-                        {
-                            $uniquePath = $this->fetchUnique();
-
-                            $args = array( $uniquePath, $this->metaData['mtime'] );
-                            if ( $extraData !== null )
-                                $args[] = $extraData;
-                            $retval = call_user_func_array( $retrieveCallback, $args );
-                            $this->fileDeleteLocal( $uniquePath );
-                            if ( $retval instanceof eZClusterFileFailure )
-                                break;
-                            return $retval;
-                        }
+                        $mtime = $localfileTS;
+                        eZDebugSetting::writeDebug( 'kernel-clustering', "Processing local cache file {$this->filePath}", __METHOD__ );
                     }
-                    eZDebugSetting::writeDebug( 'kernel-clustering', "Database file does not exist, need to regenerate data", __METHOD__ );
-                    break;
+
+                    $args = array( $this->filePath, $mtime );
+                    if ( $extraData !== null )
+                        $args[] = $extraData;
+                    $retval = call_user_func_array( $retrieveCallback, $args );
+                    if ( $retval instanceof eZClusterFileFailure )
+                    {
+                        break;
+                    }
+                    return $retval;
                 }
+
+                // if we are here, local copy does not exist/is expired and db copy is valid
+
+                // read from DB
+                if ( self::LOCAL_CACHE )
+                {
+                    eZDebugSetting::writeDebug( 'kernel-clustering', "Callback from DB file {$this->filePath}, caching locally", __METHOD__ );
+
+                    if ( $this->fetch() === false )
+                    {
+                        return new eZClusterFileFailure( eZClusterFileFailure::FILE_RETRIEVAL_FAILED, "Failed retrieving file $this->filePath from DFS." );
+                    }
+
+                    // Figure out which mtime to use for new file, must be larger than
+                    // mtime in DB at least.
+                    $mtime = $this->metaData['mtime'] + 1;
+                    $localmtime = @filemtime( $this->filePath );
+                    $mtime = max( $mtime, $localmtime );
+                    touch( $this->filePath, $mtime, $mtime );
+                    clearstatcache(); // Needed because of touch() call
+
+                    $args = array( $this->filePath, $mtime );
+                    if ( $extraData !== null )
+                        $args[] = $extraData;
+                    $retval = call_user_func_array( $retrieveCallback, $args );
+                    if ( $retval instanceof eZClusterFileFailure )
+                    {
+                        break;
+                    }
+                    return $retval;
+                }
+                else
+                {
+                    eZDebugSetting::writeDebug( 'kernel-clustering', "Callback from DB file {$this->filePath}, caching locally", __METHOD__ );
+
+                    $uniquePath = $this->fetchUnique();
+
+                    $args = array( $uniquePath, $this->metaData['mtime'] );
+                    if ( $extraData !== null )
+                        $args[] = $extraData;
+                    $retval = call_user_func_array( $retrieveCallback, $args );
+                    $this->fileDeleteLocal( $uniquePath );
+                    if ( $retval instanceof eZClusterFileFailure )
+                        break;
+                    return $retval;
+                }
+
+                /// @todo none ever augments $tries
+
             }
 
             if ( $tries >= 2 )
@@ -661,7 +653,7 @@ class eZDFSFileHandler implements eZClusterFileHandlerInterface, ezpDatabaseBase
                 // the retrieved data was expired so we need to generate it, let's continue
             }
 
-            // We need to lock if we have a generate-callback or
+            // We need to look if we have a generate-callback or
             // the generation is deferred to the caller.
             // Note: false means no generation, while null means that generation
             // is deferred to the processing that follows (f.i. cache-blocks)
