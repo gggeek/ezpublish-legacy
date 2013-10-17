@@ -44,7 +44,7 @@
   - unique - A unique index
 
   Field Types:
-  - int - Integer, uses \c length to define number of digits.
+  - int, bigint - Integer, uses \c length to define number of digits.
   - float - Float, uses \c length to define number of digits.
   - auto_increment - Integer that auto increments (uses sequence+trigger).
   - varchar - String with variable length, uses \c length for max length.
@@ -791,7 +791,7 @@ class eZDBSchemaInterface
     */
     function generateDataValueTextSQL( $fieldDef, $value )
     {
-        if ( $fieldDef['type'] == 'auto_increment' or
+        if ( $fieldDef['type'] == 'auto_increment' or $fieldDef['type'] == 'bigint' or
              $fieldDef['type'] == 'int' or
              $fieldDef['type'] == 'float' )
         {
